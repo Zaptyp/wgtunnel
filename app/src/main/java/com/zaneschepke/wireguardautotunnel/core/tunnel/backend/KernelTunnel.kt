@@ -32,6 +32,7 @@ class KernelTunnel(private val runConfigHelper: RunConfigHelper, private val bac
     TunnelBackend {
 
     private val runtimeTunnels = ConcurrentHashMap<Int, Tunnel>()
+    private val runtimeConfigs = ConcurrentHashMap<Int, com.wireguard.config.Config>()
 
     private fun validateWireGuardInterfaceName(name: String): Result<Unit> {
         if (name.isEmpty() || name.length > 15)
@@ -59,9 +60,24 @@ class KernelTunnel(private val runConfigHelper: RunConfigHelper, private val bac
             stateChannel.consumeAsFlow().collect { state -> trySend(state.asTunnelState()) }
         }
 
+        val runConfig = try {
+            runConfigHelper.buildWgRunConfig(tunnelConfig)
+        } catch (e: Exception) {
+            Timber.Forest.e(e, "Failed to build run config for ${tunnelConfig.name}")
+            runtimeTunnels.remove(tunnelConfig.id)
+            consumerJob.cancel()
+            stateChannel.close()
+            throw InvalidConfig()
+        }
+        runtimeConfigs[tunnelConfig.id] = runConfig
+
         try {
-            val runConfig = runConfigHelper.buildWgRunConfig(tunnelConfig)
-            backend.setState(runtimeTunnel, Tunnel.State.UP, runConfig)
+            if (backend.runningTunnelNames.contains(tunnelConfig.name)) {
+                Timber.Forest.i("Kernel tunnel ${tunnelConfig.name} is already running (likely process-death re-attach) — skipping setState(UP)")
+                launch { stateChannel.send(Tunnel.State.UP) }
+            } else {
+                backend.setState(runtimeTunnel, Tunnel.State.UP, runConfig)
+            }
         } catch (e: TimeoutCancellationException) {
             Timber.Forest.e("Startup timed out for ${tunnelConfig.name}")
             throw DnsFailure()
@@ -76,14 +92,17 @@ class KernelTunnel(private val runConfigHelper: RunConfigHelper, private val bac
         }
 
         awaitClose {
+            val ownedConfig = runtimeConfigs.remove(tunnelConfig.id)
+            runtimeTunnels.remove(tunnelConfig.id)
             try {
-                backend.setState(runtimeTunnel, Tunnel.State.DOWN, null)
+                if (ownedConfig != null) {
+                    backend.setState(runtimeTunnel, Tunnel.State.DOWN, ownedConfig)
+                }
             } catch (e: BackendException) {
                 // Errors are emitted by caller (lifecycle manager)
             } finally {
                 consumerJob.cancel()
                 stateChannel.close()
-                runtimeTunnels.remove(tunnelConfig.id)
                 trySend(TunnelStatus.Down)
             }
         }
@@ -116,13 +135,16 @@ class KernelTunnel(private val runConfigHelper: RunConfigHelper, private val bac
     }
 
     override suspend fun forceStopTunnel(tunnelId: Int) {
-        val runtimeTunnel = runtimeTunnels[tunnelId] ?: return
+        val runtimeTunnel = runtimeTunnels.remove(tunnelId) ?: return
+        val config = runtimeConfigs.remove(tunnelId)
         try {
-            backend.setState(runtimeTunnel, Tunnel.State.DOWN, null)
+            if (config != null) {
+                backend.setState(runtimeTunnel, Tunnel.State.DOWN, config)
+            } else {
+                Timber.w("No cached config for tunnel $tunnelId — skipping setState(DOWN) in forceStop")
+            }
         } catch (e: BackendException) {
             Timber.Forest.e(e, "Force stop failed for $tunnelId")
-        } finally {
-            runtimeTunnels.remove(tunnelId)
         }
     }
 }

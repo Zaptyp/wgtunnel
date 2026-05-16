@@ -285,6 +285,20 @@ class TunnelManager(
                         tunnels.filter { it.isActive }.forEach { conf -> startTunnel(conf) }
                 }
             }
+            if (currentSettings.appMode == AppMode.KERNEL && tunnels != null) {
+                val alreadyStartedNames =
+                    tunnels.filter { it.isActive }.map { it.name }.toSet()
+                val kernelRunning =
+                    lifecycleManagers[AppMode.KERNEL]?.runningTunnelNames() ?: emptySet()
+                tunnels
+                    .filter { conf ->
+                        conf.name in kernelRunning && conf.name !in alreadyStartedNames
+                    }
+                    .forEach { conf ->
+                        Timber.i("Kernel orphan detected: ${conf.name} is running but not active in DB — re-attaching")
+                        startTunnel(conf)
+                    }
+            }
         }
 
     private suspend fun restoreAutoTunnel(autoTunnelSettings: AutoTunnelSettings) {
